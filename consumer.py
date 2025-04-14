@@ -1,6 +1,7 @@
 # trace-processor/consumer.py
 import json
 import logging
+import os
 import time
 from confluent_kafka import Consumer, KafkaException
 from typing import Dict
@@ -16,7 +17,7 @@ class KafkaConsumer:
         self.config = {
             'bootstrap.servers': bootstrap_servers,
             'group.id': group_id,
-            'auto.offset.reset': 'earliest',
+            'auto.offset.reset': 'lastest',
             'enable.auto.commit': True,
         }
         self.topic = topic
@@ -36,7 +37,7 @@ class KafkaConsumer:
 
     def process_message(self, message: Dict) -> None:
         logger.info(f"Processing JSON message: {message}")
-        # In phase 3, add PDF processing here (e.g., extract_pdf(message['bucket_url']))
+        # In phase 3, add PDF processing here
 
     def consume(self) -> None:
         if not self.consumer:
@@ -77,9 +78,10 @@ class KafkaConsumer:
             self.consumer = None
 
 def main():
-    bootstrap_servers = 'pdf-upload-kafka.kafka.svc.cluster.local:9092'
-    group_id = 'trace-processor-group'
-    topic = 'pdf-upload'
+    # Read from environment variables with defaults
+    bootstrap_servers = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka-cluster-dns-name:9092')
+    group_id = os.getenv('KAFKA_GROUP_ID', 'group-name')
+    topic = os.getenv('KAFKA_TOPIC', 'topic-name')
 
     consumer = KafkaConsumer(bootstrap_servers, group_id, topic)
     try:
