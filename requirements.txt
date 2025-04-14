@@ -1,0 +1,2 @@
+# trace-processor/requirements.txt
+confluent-kafka==2.5.0
