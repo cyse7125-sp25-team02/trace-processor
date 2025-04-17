@@ -8,6 +8,7 @@ from vertexai.language_models import TextEmbeddingModel, TextEmbeddingInput
 from mistralai import Mistral
 import pinecone
 from tqdm.auto import tqdm
+from typing import List, Dict, Any
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -62,17 +63,40 @@ def process_pdf_ocr(client: Mistral, pdf_path: str) -> str:
     logger.info("OCR processing completed")
     return markdown_content
 
-def chunk_feedback_by_qa(markdown_content: str, document_metadata: Dict) -> List[Dict]:
+def create_text_for_embedding(metadata: Dict[str, Any], feedback_text: str) -> str:
+    """Helper function to format the text string for embedding."""
+    lines = [
+        f"Course: {metadata.get('course_name', 'N/A')} ({metadata.get('course_code', 'N/A')})",
+        f"Instructor: {metadata.get('instructor_name', 'N/A')}",
+        f"Semester: {metadata.get('semester_term', 'N/A')} {metadata.get('semester_year', 'N/A')}",
+        f"Credit Hours: {metadata.get('credit_hours', 'N/A')}",
+        f"Question: {metadata.get('question', 'N/A')}",
+        f"Feedback: {feedback_text}"
+    ]
+    return "\n".join(lines)
+
+def chunk_feedback_by_qa(markdown_content: str, document_metadata: dict) -> List[Dict[str, Any]]:
     """
-    Chunk Markdown feedback text based on Q&A structure, cleaning noise components.
+    Chunks Markdown feedback text based on Questions and Answers structure.
+    Removes individual noise components (like $, \boldsymbol, \star, {, }, Unicode stars/circles)
+    from anywhere within the lines. Ignores header lines ending in "(X comments)"
+    and handles various Q: formats.
+
+    Args:
+        markdown_content: The Markdown text extracted from the PDF.
+        document_metadata: Dictionary containing metadata for the entire document.
+
+    Returns:
+        A list of dictionaries, where each dictionary represents a chunk.
     """
-    logger.info("Starting chunking process.")
+    logging.info("Starting chunking process.")
     chunks = []
-    current_question = "General Comment"
+    current_question = "General Comment" # Default if answer appears before first Q:
     lines = markdown_content.splitlines()
     answer_buffer = []
     current_answer_id = None
 
+    # --- Regex Patterns ---
     comprehensive_noise_pattern = re.compile(
         r'\\boldsymbol|\\star|\$|\{|\}|[\u2605\u2606\u2730\u24EA\u3147]',
         re.IGNORECASE | re.UNICODE
@@ -80,65 +104,103 @@ def chunk_feedback_by_qa(markdown_content: str, document_metadata: Dict) -> List
     question_pattern = re.compile(r"^(?:##? )?Q:\s*(.*)", re.IGNORECASE)
     answer_start_pattern = re.compile(r"^\s*(\d+| \d+[\.\s]|\*|\-)\s*(.*)")
     table_answer_start_pattern = re.compile(r"^\s*\|\s*(\d+)\s*\|\s*(.*)\s*\|")
+
     header_comment_pattern = re.compile(r"\(\s*\d+\s+comments\s*\)\s*$", re.IGNORECASE)
 
+    # --- Helper function to process the buffered answer ---
     def process_buffer():
-        nonlocal answer_buffer, current_question, current_answer_id, chunks
+        nonlocal answer_buffer, current_question, current_answer_id, chunks, document_metadata
         if answer_buffer:
-            full_answer_text = "\n".join(answer_buffer).strip()
-            if full_answer_text:
+            original_feedback_text = "\n".join(answer_buffer).strip()
+            if original_feedback_text: # Avoid empty chunks
                 chunk_id = str(uuid.uuid4())
                 cleaned_answer_id = str(current_answer_id).strip('. ') if current_answer_id else None
-                metadata = {
+                metadata_for_pinecone = {
                     **document_metadata,
                     "question": current_question,
                     "answer_id": cleaned_answer_id,
+                    "original_text": original_feedback_text # Add original text here
                 }
+
+                temp_meta_for_formatting = {
+                     **document_metadata,
+                     'question': current_question
+                }
+                text_to_embed = create_text_for_embedding(temp_meta_for_formatting, original_feedback_text)
+
                 chunks.append({
                     "id": chunk_id,
-                    "text": full_answer_text,
-                    "metadata": metadata
+                    "text": text_to_embed,
+                    "metadata": metadata_for_pinecone
                 })
+                # logging.debug(f"Created chunk: ID={chunk_id}, Q='{current_question}', A_ID={cleaned_answer_id}")
         answer_buffer = []
+        # Reset answer_id only after processing buffer that might use it
+        # current_answer_id = None # Let the main loop set the new ID
+    # --- End Helper ---
 
-    for raw_line in lines:
+    # --- Main Processing Loop ---
+    for line_num, raw_line in enumerate(lines):
+        # 1. Clean the line: remove individual noise components globally, then strip whitespace
         cleaned_line = comprehensive_noise_pattern.sub('', raw_line)
         line = cleaned_line.strip()
 
+        # Optional: Log if line was changed by noise removal
+        # if raw_line.strip() != line:
+        #    logging.debug(f"Line {line_num+1}: Noise removed. Original='{raw_line.strip()}', Cleaned='{line}'")
+
+        # 2. Skip empty lines or potential noise like image tags or separators
         if not line or line.startswith("![img-") or line.startswith("---") or line == '| :--: | :--: |':
             continue
 
+        # 3. Skip header lines with comment counts
         if header_comment_pattern.search(line):
+            # logging.debug(f"Skipping header line: {line}")
             continue
 
+        # 4. Check for a new question
         question_match = question_pattern.match(line)
         if question_match:
-            process_buffer()
+            process_buffer() # Process previous answer before starting new question
             current_question = question_match.group(1).strip()
-            current_answer_id = None
+            current_answer_id = None # Reset answer ID for new question
+            # logging.debug(f"Found Question: {current_question}")
             continue
 
+        # 5. Check if the line starts a new answer (numbered/bulleted or table row)
         answer_match = answer_start_pattern.match(line)
         table_match = table_answer_start_pattern.match(line)
         match_found = answer_match or table_match
 
         if match_found:
-            process_buffer()
+            process_buffer() # Process previous answer buffer before starting new one
             if answer_match:
-                current_answer_id = answer_match.group(1)
-                answer_text = answer_match.group(2).strip()
-            else:
+                # Group 1 contains the identifier (e.g., "1.", "1", "*")
+                current_answer_id = answer_match.group(1) # Keep original identifier temporarily
+                answer_text = answer_match.group(2).strip() # Group 2 is the text after identifier
+            else: # table_match
                 current_answer_id = table_match.group(1).strip()
                 answer_text = table_match.group(2).strip()
 
-            if answer_text:
-                answer_buffer.append(answer_text)
-        elif answer_buffer:
-            if not (line.startswith("|") and line.strip("|").strip() == ':--:'):
-                answer_buffer.append(line)
+            if answer_text: # Only start buffer if there's actual text after the identifier
+                 answer_buffer.append(answer_text)
+                 # logging.debug(f"Found Answer Start ({current_answer_id}): {answer_text}")
+            # else: If answer_text is empty (like for line "6"), buffer remains empty, but current_answer_id is set to "6"
 
+        elif answer_buffer:
+            # 6. If buffer is active, append line if it's likely a continuation
+            # Avoid appending table formatting lines unless they contain actual content beyond pipes
+            if not (line.startswith("|") and line.strip("|").strip() == ':--:'):
+                 # logging.debug(f"Appending to Answer ({current_answer_id}): {line}")
+                 answer_buffer.append(line) # Append the cleaned line
+        # else:
+            # Lines that don't match any pattern and where buffer is empty are ignored
+            # logging.debug(f"Ignoring unmatched line: {line}")
+
+    # Process any remaining answer in the buffer after the loop finishes
     process_buffer()
-    logger.info(f"Chunking completed. Generated {len(chunks)} chunks.")
+
+    logging.info(f"Chunking completed. Generated {len(chunks)} chunks.")
     return chunks
 
 def initialize_vertex_ai(project_id: str, location: str = "us-central1") -> TextEmbeddingModel:
