@@ -6,7 +6,7 @@ import time
 import tempfile
 from confluent_kafka import Consumer, KafkaException
 from typing import Dict
-from pdf_to_text import process_pdf_pipeline  # Import the pipeline function
+from worker import process_pdf_pipeline  # Import the pipeline function
 from google.cloud import storage  # For GCS download
 
 logging.basicConfig(
